@@ -36,3 +36,4 @@ cfst_data/
 openspec
 /.venv
 .agent
+/worker-proxy/wrangler.toml

@@ -8,6 +8,26 @@ const CORS = {
 };
 const CFIP_SYNC_ALLOWED_CONDITION = '(sync_blacklisted = 0 OR sync_blacklisted IS NULL)';
 const CFIP_SUBSCRIBE_ALLOWED_CONDITION = '(node_blacklisted = 0 OR node_blacklisted IS NULL)';
+const SMART_NODE_QUERY_CHUNK_SIZE = 50;
+let dbInitialized = false;
+let dbInitPromise = null;
+
+async function ensureDB(db) {
+    if (dbInitialized) return;
+
+    if (!dbInitPromise) {
+        dbInitPromise = initDB(db)
+            .then(() => {
+                dbInitialized = true;
+            })
+            .catch(error => {
+                dbInitPromise = null;
+                throw error;
+            });
+    }
+
+    await dbInitPromise;
+}
 
 // 自动初始化数据库
 async function initDB(db) {
@@ -92,6 +112,17 @@ async function initDB(db) {
 
     try {
         await db.prepare(`ALTER TABLE argo_subscribe ADD COLUMN include_blacklisted_cfip INTEGER DEFAULT 0`).run().catch(() => { });
+    } catch (e) {
+        // 忽略错误
+    }
+
+    try {
+        await db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_cf_ips_status_speed ON cf_ips(status, speed DESC, sort_order, id);
+            CREATE INDEX IF NOT EXISTS idx_cf_ips_status_latency ON cf_ips(status, latency, sort_order, id);
+            CREATE INDEX IF NOT EXISTS idx_cf_ips_node_status_speed ON cf_ips(node_blacklisted, status, speed DESC, sort_order, id);
+            CREATE INDEX IF NOT EXISTS idx_subscribe_config_token_enabled ON subscribe_config(token, enabled);
+        `).catch(() => { });
     } catch (e) {
         // 忽略错误
     }
@@ -300,6 +331,74 @@ function getSmartNodeCfips(cfips) {
     return cfips.filter(cfip => parseProxyType(cfip?.address) !== 'domain');
 }
 
+function buildCfipWhereClause(cfipStatusParam, cfipSubscribeCondition) {
+    const conditions = parseCfipStatusConditions(cfipStatusParam);
+    return `(${conditions.join(' OR ')}) AND ${cfipSubscribeCondition}`;
+}
+
+async function queryTopSmartNodeCfips(db, whereClause, orderBy, count, extraCondition = '') {
+    const selected = [];
+    const chunkSize = Math.max(SMART_NODE_QUERY_CHUNK_SIZE, count * 4);
+    let offset = 0;
+
+    while (selected.length < count) {
+        const query = `SELECT * FROM cf_ips WHERE ${whereClause}${extraCondition} ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
+        const { results = [] } = await db.prepare(query).bind(chunkSize, offset).all();
+        if (results.length === 0) break;
+
+        const smartCfips = getSmartNodeCfips(results);
+        selected.push(...smartCfips.slice(0, count - selected.length));
+        offset += results.length;
+
+        if (results.length < chunkSize) break;
+    }
+
+    return selected;
+}
+
+async function querySmartNodeCfips(db, whereClause, topSpeedCount, topLatencyCount) {
+    const [topSpeedCfips, topLatencyCfips] = await Promise.all([
+        topSpeedCount > 0
+            ? queryTopSmartNodeCfips(db, whereClause, 'speed DESC, sort_order, id', topSpeedCount)
+            : Promise.resolve([]),
+        topLatencyCount > 0
+            ? queryTopSmartNodeCfips(db, whereClause, 'latency ASC, sort_order, id', topLatencyCount, ' AND latency IS NOT NULL AND latency > 0')
+            : Promise.resolve([]),
+    ]);
+
+    return { topSpeedCfips, topLatencyCfips };
+}
+
+async function resolveSubscribeCfips(db, cfipIds, cfipStatusParam, cfipSubscribeCondition, smartOnly, topSpeedCount, topLatencyCount) {
+    let cfips = [];
+    let topSpeedCfips = [];
+    let topLatencyCfips = [];
+    const useSmartOnlyQuery = smartOnly && cfipIds.length === 0;
+
+    if (cfipIds.length > 0) {
+        const placeholders = cfipIds.map(() => '?').join(',');
+        const { results } = await db.prepare(`SELECT * FROM cf_ips WHERE id IN (${placeholders}) AND ${cfipSubscribeCondition} ORDER BY speed DESC, sort_order, id`).bind(...cfipIds).all();
+        cfips = results;
+    } else if (useSmartOnlyQuery) {
+        const whereClause = buildCfipWhereClause(cfipStatusParam, cfipSubscribeCondition);
+        ({ topSpeedCfips, topLatencyCfips } = await querySmartNodeCfips(db, whereClause, topSpeedCount, topLatencyCount));
+        cfips = [...topSpeedCfips, ...topLatencyCfips];
+    } else {
+        const whereClause = buildCfipWhereClause(cfipStatusParam, cfipSubscribeCondition);
+        const query = `SELECT * FROM cf_ips WHERE ${whereClause} ORDER BY speed DESC, sort_order, id`;
+        const { results } = await db.prepare(query).all();
+        cfips = results;
+    }
+
+    return { cfips, topSpeedCfips, topLatencyCfips, useSmartOnlyQuery };
+}
+
+function encodeSubscriptionResponse(links) {
+    return new Response(btoa(unescape(encodeURIComponent(links.join('\n')))), {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
+    });
+}
+
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -308,7 +407,7 @@ export default {
 
         if (method === 'OPTIONS') return new Response(null, { headers: CORS });
 
-        await initDB(env.DB);
+        await ensureDB(env.DB);
 
         // 路由
         // 公开订阅
@@ -325,7 +424,7 @@ export default {
                 return handleArgoSubscribe(env.DB, parts[3], request.url);
             } else if (parts[2] === 'clash') {
                 // Clash 订阅转换
-                return handleClashSubscribe(env.DB, request.url, env);
+                return handleClashSubscribe(env.DB, request, env);
             } else if (parts[2]) {
                 // V<span>LESS</span> 订阅: /sub/uuid (兼容旧版)
                 return handleSubscribe(env.DB, parts[2], request.url);
@@ -1599,26 +1698,23 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
     const cfipIds = urlParams.get('cfip')?.split(',').filter(id => id.trim()) || [];
     const { topSpeedCount, topLatencyCount, extraCount } = parseSmartNodeCounts(urlParams);
     const enableSmartNode = topSpeedCount > 0 || topLatencyCount > 0;
+    const smartOnly = enableSmartNode && extraCount === 0;
 
     // cfipStatus 参数用于按状态筛选: enabled, disabled, invalid
     // 支持旧的 status 参数作为后备
     const cfipStatusParam = urlParams.get('cfipStatus') || urlParams.get('status');
 
     // 获取CFIP列表
-    let cfips = [];
     const cfipSubscribeCondition = getCfipSubscribeConditionFromParams(urlParams, config.include_blacklisted_cfip);
-    if (cfipIds.length > 0) {
-        // 指定了CFIP ID，获取指定的CFIP（不管启用状态）
-        const placeholders = cfipIds.map(() => '?').join(',');
-        const { results } = await db.prepare(`SELECT * FROM cf_ips WHERE id IN (${placeholders}) AND ${cfipSubscribeCondition} ORDER BY speed DESC, sort_order, id`).bind(...cfipIds).all();
-        cfips = results;
-    } else {
-        // 未指定CFIP ID，根据 cfipStatus 筛选
-        const conditions = parseCfipStatusConditions(cfipStatusParam);
-        const query = `SELECT * FROM cf_ips WHERE (${conditions.join(' OR ')}) AND ${cfipSubscribeCondition} ORDER BY speed DESC, sort_order, id`;
-        const { results } = await db.prepare(query).all();
-        cfips = results;
-    }
+    let { cfips, topSpeedCfips, topLatencyCfips, useSmartOnlyQuery } = await resolveSubscribeCfips(
+        db,
+        cfipIds,
+        cfipStatusParam,
+        cfipSubscribeCondition,
+        smartOnly,
+        topSpeedCount,
+        topLatencyCount
+    );
 
     if (cfips.length === 0) return new Response('No CFIP', { status: 404 });
 
@@ -1701,9 +1797,10 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
 
     // 生成所有 ProxyIP × CFIP 的组合（相同 ProxyIP 的放在一起）
     const links = [];
+    const regularCfips = smartOnly ? [] : cfips;
     if (allProxies.length === 0) {
         // 没有 ProxyIP，只生成 CFIP
-        for (const cfip of cfips) {
+        for (const cfip of regularCfips) {
             let host = cfip.address;
             if (host.includes(':') && !host.startsWith('[')) host = `[${host}]`;
             const nodeName = `${cfip.name || cfip.remark || host}-${configRemark}`;
@@ -1712,7 +1809,7 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
     } else {
         // 为每个 ProxyIP 生成所有 CFIP 的组合
         for (const proxyip of allProxies) {
-            for (const cfip of cfips) {
+            for (const cfip of regularCfips) {
                 let host = cfip.address;
                 if (host.includes(':') && !host.startsWith('[')) host = `[${host}]`;
 
@@ -1726,15 +1823,18 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
     }
 
     // 智能节点：在最前面插入最大速度和最低延迟节点
+    let smartLinkCount = 0;
     if (enableSmartNode) {
-        const smartNodeCfips = getSmartNodeCfips(cfips);
-        const topSpeedCfips = topSpeedCount > 0
-            ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
-            : [];
-        const topLatencyCfips = topLatencyCount > 0
-            ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
-                .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
-            : [];
+        if (!useSmartOnlyQuery) {
+            const smartNodeCfips = getSmartNodeCfips(cfips);
+            topSpeedCfips = topSpeedCount > 0
+                ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
+                : [];
+            topLatencyCfips = topLatencyCount > 0
+                ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
+                    .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
+                : [];
+        }
 
         const smartLinks = [];
         if (allProxies.length === 0) {
@@ -1770,6 +1870,7 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
                 });
             }
         }
+        smartLinkCount = smartLinks.length;
         links.unshift(...smartLinks);
     }
 
@@ -1779,28 +1880,16 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
     // 如果 extraCount 大于实际订阅数量，则按实际数量为准
     if (extraCount === 0 && enableSmartNode) {
         // 只保留智能节点，移除所有其他订阅
-        const smartNodeCount = (topSpeedCount > 0 ? topSpeedCount : 0) + (topLatencyCount > 0 ? topLatencyCount : 0);
-        const multiplier = allProxies.length > 0 ? allProxies.length : 1;
-        const totalSmartNodes = smartNodeCount * multiplier;
-        return new Response(btoa(unescape(encodeURIComponent(links.slice(0, totalSmartNodes).join('\n')))), {
-            headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
-        });
+        return encodeSubscriptionResponse(links.slice(0, smartLinkCount));
     } else if (extraCount > 0 && enableSmartNode) {
         // 保留智能节点 + extraCount 条额外订阅
-        const smartNodeCount = (topSpeedCount > 0 ? topSpeedCount : 0) + (topLatencyCount > 0 ? topLatencyCount : 0);
-        const multiplier = allProxies.length > 0 ? allProxies.length : 1;
-        const totalSmartNodes = smartNodeCount * multiplier;
         // 额外订阅数量不能超过实际订阅数量
-        const actualExtraCount = Math.min(extraCount, links.length - totalSmartNodes);
-        const finalLinks = links.slice(0, totalSmartNodes + actualExtraCount);
-        return new Response(btoa(unescape(encodeURIComponent(finalLinks.join('\n')))), {
-            headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
-        });
+        const actualExtraCount = Math.min(extraCount, links.length - smartLinkCount);
+        const finalLinks = links.slice(0, smartLinkCount + actualExtraCount);
+        return encodeSubscriptionResponse(finalLinks);
     }
 
-    return new Response(btoa(unescape(encodeURIComponent(links.join('\n')))), {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
-    });
+    return encodeSubscriptionResponse(links);
 }
 
 // SS 公开订阅
@@ -1818,25 +1907,22 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
     const cfipIds = urlParams.get('cfip')?.split(',').filter(id => id.trim()) || [];
     const { topSpeedCount, topLatencyCount, extraCount } = parseSmartNodeCounts(urlParams);
     const enableSmartNode = topSpeedCount > 0 || topLatencyCount > 0;
+    const smartOnly = enableSmartNode && extraCount === 0;
 
     // cfipStatus 参数用于按状态筛选: enabled, disabled, invalid
     const cfipStatusParam = urlParams.get('cfipStatus');
 
     // 获取CFIP列表
-    let cfips = [];
     const cfipSubscribeCondition = getCfipSubscribeConditionFromParams(urlParams, config.include_blacklisted_cfip);
-    if (cfipIds.length > 0) {
-        // 指定了CFIP ID，获取指定的CFIP（不管启用状态）
-        const placeholders = cfipIds.map(() => '?').join(',');
-        const { results } = await db.prepare(`SELECT * FROM cf_ips WHERE id IN (${placeholders}) AND ${cfipSubscribeCondition} ORDER BY speed DESC, sort_order, id`).bind(...cfipIds).all();
-        cfips = results;
-    } else {
-        // 未指定CFIP ID，根据 cfipStatus 筛选
-        const conditions = parseCfipStatusConditions(cfipStatusParam);
-        const query = `SELECT * FROM cf_ips WHERE (${conditions.join(' OR ')}) AND ${cfipSubscribeCondition} ORDER BY speed DESC, sort_order, id`;
-        const { results } = await db.prepare(query).all();
-        cfips = results;
-    }
+    let { cfips, topSpeedCfips, topLatencyCfips, useSmartOnlyQuery } = await resolveSubscribeCfips(
+        db,
+        cfipIds,
+        cfipStatusParam,
+        cfipSubscribeCondition,
+        smartOnly,
+        topSpeedCount,
+        topLatencyCount
+    );
 
     if (cfips.length === 0) return new Response('No CFIP', { status: 404 });
 
@@ -1874,9 +1960,10 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
     const allProxies = [...proxyips, ...outbounds];
 
     const links = [];
+    const regularCfips = smartOnly ? [] : cfips;
     if (allProxies.length === 0) {
         // 没有 ProxyIP，只生成 CFIP
-        for (const cfip of cfips) {
+        for (const cfip of regularCfips) {
             let host = cfip.address;
             if (host.includes(':') && !host.startsWith('[')) host = `[${host}]`;
             const port = cfip.port || 443;
@@ -1892,7 +1979,7 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
     } else {
         // 为每个 ProxyIP 生成所有 CFIP 的组合
         for (const proxyip of allProxies) {
-            for (const cfip of cfips) {
+            for (const cfip of regularCfips) {
                 let host = cfip.address;
                 if (host.includes(':') && !host.startsWith('[')) host = `[${host}]`;
                 const port = cfip.port || 443;
@@ -1913,15 +2000,18 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
     }
 
     // 智能节点：在最前面插入最大速度和最低延迟节点
+    let smartLinkCount = 0;
     if (enableSmartNode) {
-        const smartNodeCfips = getSmartNodeCfips(cfips);
-        const topSpeedCfips = topSpeedCount > 0
-            ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
-            : [];
-        const topLatencyCfips = topLatencyCount > 0
-            ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
-                .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
-            : [];
+        if (!useSmartOnlyQuery) {
+            const smartNodeCfips = getSmartNodeCfips(cfips);
+            topSpeedCfips = topSpeedCount > 0
+                ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
+                : [];
+            topLatencyCfips = topLatencyCount > 0
+                ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
+                    .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
+                : [];
+        }
 
         const ssConfigStr = `${method}:${password}`;
         const encodedConfig = btoa(ssConfigStr);
@@ -1970,6 +2060,7 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
                 });
             }
         }
+        smartLinkCount = smartLinks.length;
         links.unshift(...smartLinks);
     }
 
@@ -1979,28 +2070,16 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
     // 如果 extraCount 大于实际订阅数量，则按实际数量为准
     if (extraCount === 0 && enableSmartNode) {
         // 只保留智能节点，移除所有其他订阅
-        const smartNodeCount = (topSpeedCount > 0 ? topSpeedCount : 0) + (topLatencyCount > 0 ? topLatencyCount : 0);
-        const multiplier = allProxies.length > 0 ? allProxies.length : 1;
-        const totalSmartNodes = smartNodeCount * multiplier;
-        return new Response(btoa(unescape(encodeURIComponent(links.slice(0, totalSmartNodes).join('\n')))), {
-            headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
-        });
+        return encodeSubscriptionResponse(links.slice(0, smartLinkCount));
     } else if (extraCount > 0 && enableSmartNode) {
         // 保留智能节点 + extraCount 条额外订阅
-        const smartNodeCount = (topSpeedCount > 0 ? topSpeedCount : 0) + (topLatencyCount > 0 ? topLatencyCount : 0);
-        const multiplier = allProxies.length > 0 ? allProxies.length : 1;
-        const totalSmartNodes = smartNodeCount * multiplier;
         // 额外订阅数量不能超过实际订阅数量
-        const actualExtraCount = Math.min(extraCount, links.length - totalSmartNodes);
-        const finalLinks = links.slice(0, totalSmartNodes + actualExtraCount);
-        return new Response(btoa(unescape(encodeURIComponent(finalLinks.join('\n')))), {
-            headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
-        });
+        const actualExtraCount = Math.min(extraCount, links.length - smartLinkCount);
+        const finalLinks = links.slice(0, smartLinkCount + actualExtraCount);
+        return encodeSubscriptionResponse(finalLinks);
     }
 
-    return new Response(btoa(unescape(encodeURIComponent(links.join('\n')))), {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
-    });
+    return encodeSubscriptionResponse(links);
 }
 
 // SOCKS5 测速
@@ -4320,8 +4399,82 @@ proxies:
 /**
  * Handle Clash Subscription
  */
-async function handleClashSubscribe(db, url, env) {
-    const params = new URL(url).searchParams;
+function safeDecodeURIComponent(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch (e) {
+        return value;
+    }
+}
+
+function normalizeHost(value) {
+    if (!value) return null;
+    return value.split(',')[0].trim().replace(/:\d+$/, '').toLowerCase();
+}
+
+function getLocalSubscriptionHosts(requestUrl, requestHeaders, env) {
+    const currentUrl = new URL(requestUrl);
+    return new Set([
+        normalizeHost(currentUrl.hostname),
+        normalizeHost(requestHeaders.get('Host')),
+        normalizeHost(requestHeaders.get('X-Forwarded-Host')),
+        normalizeHost(env?.PAGES_HOSTNAME),
+    ].filter(Boolean));
+}
+
+function isLocalSubscriptionUrl(subscriptionUrl, requestUrl, requestHeaders, env) {
+    let targetUrl;
+    try {
+        targetUrl = new URL(subscriptionUrl);
+    } catch (e) {
+        return false;
+    }
+
+    const parts = targetUrl.pathname.split('/');
+    if (!targetUrl.pathname.startsWith('/sub/') || parts[2] === 'clash') return false;
+    return getLocalSubscriptionHosts(requestUrl, requestHeaders, env).has(normalizeHost(targetUrl.hostname));
+}
+
+async function handleLocalSubscriptionUrl(db, subscriptionUrl) {
+    const targetUrl = new URL(subscriptionUrl);
+    const parts = targetUrl.pathname.split('/');
+
+    if (parts[2] === 'clash') return null;
+    if (parts[2] === 'token' && parts[3]) {
+        return handleSubscribeByToken(db, parts[3], targetUrl.toString());
+    }
+    if (parts[2] === 'ss' && parts[3]) {
+        return handleSSSubscribe(db, parts[3], targetUrl.toString());
+    }
+    if (parts[2] === 'argo' && parts[3]) {
+        return handleArgoSubscribe(db, parts[3], targetUrl.toString());
+    }
+    if (parts[2]) {
+        return handleSubscribe(db, parts[2], targetUrl.toString());
+    }
+
+    return null;
+}
+
+async function fetchSubscriptionContent(db, subscriptionUrl, requestUrl, requestHeaders, env) {
+    if (isLocalSubscriptionUrl(subscriptionUrl, requestUrl, requestHeaders, env)) {
+        const response = await handleLocalSubscriptionUrl(db, subscriptionUrl);
+        if (response?.ok) return response.text();
+        return null;
+    }
+
+    const response = await fetch(subscriptionUrl, {
+        headers: { 'User-Agent': 'ClashSubConverter/1.0' }
+    });
+    if (!response.ok) return null;
+
+    return response.text();
+}
+
+async function handleClashSubscribe(db, request, env) {
+    const requestUrl = typeof request === 'string' ? request : request.url;
+    const requestHeaders = typeof request === 'string' ? new Headers() : request.headers;
+    const params = new URL(requestUrl).searchParams;
     const subUrl = params.get('url');
 
     if (!subUrl) {
@@ -4329,17 +4482,14 @@ async function handleClashSubscribe(db, url, env) {
     }
 
     // Fetch subscriptions
-    const subscriptionUrls = decodeURIComponent(subUrl).split('|');
+    const subscriptionUrls = safeDecodeURIComponent(subUrl).split('|').map(item => item.trim()).filter(Boolean);
     const subParser = new SubParser();
     let allProxies = [];
 
     for (const u of subscriptionUrls) {
         try {
-            const response = await fetch(u, {
-                headers: { 'User-Agent': 'ClashSubConverter/1.0' }
-            });
-            if (response.ok) {
-                const content = await response.text();
+            const content = await fetchSubscriptionContent(db, u, requestUrl, requestHeaders, env);
+            if (content !== null) {
                 const proxies = subParser.parse(content);
                 allProxies = allProxies.concat(proxies);
             }

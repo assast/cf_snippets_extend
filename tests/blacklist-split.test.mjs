@@ -92,9 +92,11 @@ class MockPreparedStatement {
 class MockDb {
     constructor(cfips) {
         this.cfips = cfips;
+        this.queries = [];
     }
 
     prepare(query) {
+        this.queries.push(query);
         return new MockPreparedStatement(this, query);
     }
 
@@ -123,8 +125,16 @@ class MockDb {
 
         if (query.includes('ORDER BY speed DESC, sort_order, id')) {
             results.sort((a, b) => (b.speed || 0) - (a.speed || 0) || (a.sort_order || 0) - (b.sort_order || 0) || a.id - b.id);
+        } else if (query.includes('ORDER BY latency ASC, sort_order, id')) {
+            results.sort((a, b) => (a.latency || 0) - (b.latency || 0) || (a.sort_order || 0) - (b.sort_order || 0) || a.id - b.id);
         } else if (query.includes('ORDER BY sort_order, id')) {
             results.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0) || a.id - b.id);
+        }
+
+        if (query.includes('LIMIT ? OFFSET ?')) {
+            const limit = Number(params[params.length - 2]);
+            const offset = Number(params[params.length - 1]);
+            results = results.slice(offset, offset + limit);
         }
 
         return results;
@@ -168,6 +178,49 @@ test('subscribe generation excludes node blacklist but keeps DNS blacklist', asy
     assert.match(decoded, /dns-blacklisted\.example\.com/);
     assert.match(decoded, /clean\.example\.com/);
     assert.doesNotMatch(decoded, /node-blacklisted\.example\.com/);
+});
+
+test('smart-only subscribe uses limited smart CFIP query', async () => {
+    const { handleSubscribe } = await loadWorkerInternals();
+    const cfips = Array.from({ length: 120 }, (_, index) => ({
+        id: index + 1,
+        address: `198.51.100.${index + 1}`,
+        port: 443,
+        remark: `ip-${index + 1}`,
+        name: `ip-${index + 1}`,
+        status: 'enabled',
+        sync_blacklisted: 0,
+        node_blacklisted: 1,
+        sort_order: index + 1,
+        speed: 10000 - index,
+        latency: index + 1,
+        fail_count: 0,
+    }));
+    const db = new MockDb(cfips);
+    const config = {
+        uuid: 'test-uuid',
+        snippets_domain: 'worker.example.com',
+        proxy_path: '/?ed=2560',
+        remark: 'TEST',
+        include_blacklisted_cfip: 0,
+    };
+
+    const response = await handleSubscribe(
+        db,
+        'test-uuid',
+        'https://example.com/sub/test-uuid?speedTop=5&extraCount=0&latencyTop=0&include_blacklisted_cfip=1',
+        config
+    );
+    const encoded = await response.text();
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const readable = decodeURIComponent(decoded);
+    const lines = decoded.split('\n').filter(Boolean);
+    const cfipQueries = db.queries.filter(query => query.includes('FROM cf_ips'));
+
+    assert.equal(lines.length, 5);
+    assert.match(readable, /最大速度1-TEST/);
+    assert.equal(cfipQueries.length, 1);
+    assert.match(cfipQueries[0], /LIMIT \? OFFSET \?/);
 });
 
 test('typed blacklist API updates node blacklist independently', async () => {
