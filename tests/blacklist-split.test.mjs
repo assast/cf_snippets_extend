@@ -7,7 +7,7 @@ async function loadWorkerInternals() {
     let source = await fs.readFile(new URL('../public/_worker.js', import.meta.url), 'utf8');
     source = source.replace("import { connect } from 'cloudflare:sockets';", "const connect = () => { throw new Error('connect is not available in tests'); };");
     source = source.replace('export default {', 'const __workerDefault = {');
-    source += '\n;globalThis.__testExports = { handleGetCFIPs, handleSubscribe, handleSetCFIPBlacklist, handleBatchDeleteCFIPByFailCount };';
+    source += '\n;globalThis.__testExports = { handleGetCFIPs, handleSubscribe, handleArgoSubscribe, handleSetCFIPBlacklist, handleBatchDeleteCFIPByFailCount };';
 
     const context = {
         console,
@@ -54,6 +54,9 @@ class MockPreparedStatement {
         if (this.query.includes('FROM outbounds')) {
             return { results: [] };
         }
+        if (this.query.includes('FROM argo_subscribe')) {
+            return { results: this.db.queryArgoSubscribes(this.query, this.params) };
+        }
         throw new Error(`Unsupported all() query: ${this.query}`);
     }
 
@@ -90,8 +93,9 @@ class MockPreparedStatement {
 }
 
 class MockDb {
-    constructor(cfips) {
+    constructor(cfips, argoSubscribes = []) {
         this.cfips = cfips;
+        this.argoSubscribes = argoSubscribes;
         this.queries = [];
     }
 
@@ -135,6 +139,19 @@ class MockDb {
             const limit = Number(params[params.length - 2]);
             const offset = Number(params[params.length - 1]);
             results = results.slice(offset, offset + limit);
+        }
+
+        return results;
+    }
+
+    queryArgoSubscribes(query, params) {
+        let results = [...this.argoSubscribes];
+
+        if (query.includes('token = ?')) {
+            results = results.filter(item => item.token === params[0]);
+        }
+        if (query.includes('enabled = 1')) {
+            results = results.filter(item => Number(item.enabled) === 1);
         }
 
         return results;
@@ -219,6 +236,47 @@ test('smart-only subscribe uses limited smart CFIP query', async () => {
 
     assert.equal(lines.length, 5);
     assert.match(readable, /最大速度1-TEST/);
+    assert.equal(cfipQueries.length, 1);
+    assert.match(cfipQueries[0], /LIMIT \? OFFSET \?/);
+});
+
+test('argo smart-only subscribe supports smart and blacklist URL parameters', async () => {
+    const { handleArgoSubscribe } = await loadWorkerInternals();
+    const cfips = Array.from({ length: 120 }, (_, index) => ({
+        id: index + 1,
+        address: `198.51.100.${index + 1}`,
+        port: 443,
+        remark: `ip-${index + 1}`,
+        name: `ip-${index + 1}`,
+        status: 'enabled',
+        sync_blacklisted: 0,
+        node_blacklisted: 1,
+        sort_order: index + 1,
+        speed: 10000 - index,
+        latency: index + 1,
+        fail_count: 0,
+    }));
+    const db = new MockDb(cfips, [{
+        token: 'argo-token',
+        template_link: 'vless://test-uuid@origin.example.com:443?encryption=none&security=tls&type=ws#ARGO',
+        enabled: 1,
+        include_blacklisted_cfip: 0,
+    }]);
+
+    const response = await handleArgoSubscribe(
+        db,
+        'argo-token',
+        'https://example.com/sub/argo/argo-token?speedTop=5&extraCount=0&latencyTop=0&include_blacklisted_cfip=1'
+    );
+    const encoded = await response.text();
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const readable = decodeURIComponent(decoded);
+    const lines = decoded.split('\n').filter(Boolean);
+    const cfipQueries = db.queries.filter(query => query.includes('FROM cf_ips'));
+
+    assert.equal(lines.length, 5);
+    assert.match(readable, /最大速度1-ARGO/);
+    assert.match(decoded, /198\.51\.100\.1/);
     assert.equal(cfipQueries.length, 1);
     assert.match(cfipQueries[0], /LIMIT \? OFFSET \?/);
 });

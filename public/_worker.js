@@ -393,6 +393,34 @@ async function resolveSubscribeCfips(db, cfipIds, cfipStatusParam, cfipSubscribe
     return { cfips, topSpeedCfips, topLatencyCfips, useSmartOnlyQuery };
 }
 
+function resolveSmartCfipGroups(cfips, topSpeedCfips, topLatencyCfips, useSmartOnlyQuery, topSpeedCount, topLatencyCount) {
+    if (useSmartOnlyQuery) return { topSpeedCfips, topLatencyCfips };
+
+    const smartNodeCfips = getSmartNodeCfips(cfips);
+    return {
+        topSpeedCfips: topSpeedCount > 0
+            ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
+            : [],
+        topLatencyCfips: topLatencyCount > 0
+            ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
+                .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
+            : [],
+    };
+}
+
+function finalizeSmartSubscriptionLinks(links, smartLinkCount, enableSmartNode, extraCount) {
+    if (extraCount === 0 && enableSmartNode) {
+        return links.slice(0, smartLinkCount);
+    }
+
+    if (extraCount > 0 && enableSmartNode) {
+        const actualExtraCount = Math.min(extraCount, links.length - smartLinkCount);
+        return links.slice(0, smartLinkCount + actualExtraCount);
+    }
+
+    return links;
+}
+
 function encodeSubscriptionResponse(links) {
     return new Response(btoa(unescape(encodeURIComponent(links.join('\n')))), {
         headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
@@ -1325,15 +1353,22 @@ async function handleArgoSubscribe(db, token, url) {
 
     // 解析URL参数中的 cfipStatus (支持旧的 status 参数作为后备)
     const urlParams = new URL(url).searchParams;
+    const cfipIds = urlParams.get('cfip')?.split(',').filter(id => id.trim()) || [];
+    const { topSpeedCount, topLatencyCount, extraCount } = parseSmartNodeCounts(urlParams);
+    const enableSmartNode = topSpeedCount > 0 || topLatencyCount > 0;
+    const smartOnly = enableSmartNode && extraCount === 0;
     const cfipStatusParam = urlParams.get('cfipStatus') || urlParams.get('status');
 
-    // 使用 parseCfipStatusConditions 解析状态条件
-    const conditions = parseCfipStatusConditions(cfipStatusParam);
     const cfipSubscribeCondition = getCfipSubscribeConditionFromParams(urlParams, template.include_blacklisted_cfip);
-    const query = `SELECT * FROM cf_ips WHERE (${conditions.join(' OR ')}) AND ${cfipSubscribeCondition} ORDER BY speed DESC, sort_order, id`;
-
-    // 2. 获取符合条件的CFIP
-    const { results: cfips } = await db.prepare(query).all();
+    let { cfips, topSpeedCfips, topLatencyCfips, useSmartOnlyQuery } = await resolveSubscribeCfips(
+        db,
+        cfipIds,
+        cfipStatusParam,
+        cfipSubscribeCondition,
+        smartOnly,
+        topSpeedCount,
+        topLatencyCount
+    );
 
     if (!cfips || cfips.length === 0) {
         return new Response('No enabled CFIP found', { status: 404 });
@@ -1341,24 +1376,46 @@ async function handleArgoSubscribe(db, token, url) {
 
     // 3. 解析模板并替换优选域名/IP
     try {
-        const links = generateArgoVlLinks(template.template_link, cfips);
+        const links = generateArgoVlLinks(template.template_link, smartOnly ? [] : cfips);
+        let smartLinkCount = 0;
 
-        // 4. 返回Base64编码的订阅内容
-        const subscriptionContent = links.join('\n');
-        const base64Content = btoa(subscriptionContent);
+        if (enableSmartNode) {
+            ({ topSpeedCfips, topLatencyCfips } = resolveSmartCfipGroups(
+                cfips,
+                topSpeedCfips,
+                topLatencyCfips,
+                useSmartOnlyQuery,
+                topSpeedCount,
+                topLatencyCount
+            ));
 
-        return new Response(base64Content, {
-            headers: {
-                'Content-Type': 'text/plain; charset=utf-8',
-                'Cache-Control': 'no-store, no-cache, must-revalidate'
-            }
-        });
+            const speedLinks = generateArgoVlLinks(
+                template.template_link,
+                topSpeedCfips,
+                (_cfip, index, originalRemark) => `最大速度${index + 1}-${originalRemark || 'ARGO'}`
+            );
+            const latencyLinks = generateArgoVlLinks(
+                template.template_link,
+                topLatencyCfips,
+                (_cfip, index, originalRemark) => `最低延迟${index + 1}-${originalRemark || 'ARGO'}`
+            );
+            const smartLinks = [...speedLinks, ...latencyLinks];
+            smartLinkCount = smartLinks.length;
+            links.unshift(...smartLinks);
+        }
+
+        return encodeSubscriptionResponse(finalizeSmartSubscriptionLinks(links, smartLinkCount, enableSmartNode, extraCount));
     } catch (error) {
         return new Response(`Error: ${error.message}`, { status: 500 });
     }
 }
 
-function generateArgoVlLinks(templateLink, cfips) {
+function buildArgoNodeRemark(originalRemark, cfip, index, remarkBuilder) {
+    if (remarkBuilder) return remarkBuilder(cfip, index, originalRemark);
+    return `${originalRemark}-${cfip.name || cfip.remark || cfip.address}`;
+}
+
+function generateArgoVlLinks(templateLink, cfips, remarkBuilder = null) {
     const links = [];
 
     // 判断是V<span>LESS</span>还是V<span>Mess</span>格式
@@ -1376,7 +1433,7 @@ function generateArgoVlLinks(templateLink, cfips) {
         const originalRemark = fragment ? decodeURIComponent(fragment.substring(1)) : '';
 
         // 为每个启用的CFIP生成节点
-        for (const cfip of cfips) {
+        for (const [index, cfip] of cfips.entries()) {
             let host = cfip.address;
             const port = cfip.port || 443;
 
@@ -1386,7 +1443,7 @@ function generateArgoVlLinks(templateLink, cfips) {
             }
 
             // 构建新的V<span>LESS</span>链接（替换host:port）
-            const newRemark = `${originalRemark}-${cfip.name || cfip.remark || cfip.address}`;
+            const newRemark = buildArgoNodeRemark(originalRemark, cfip, index, remarkBuilder);
             const vlLink = `v${'less'}://${uuid}@${host}:${port}${queryString || ''}#${encodeURIComponent(newRemark)}`;
 
             links.push(vlLink);
@@ -1402,7 +1459,7 @@ function generateArgoVlLinks(templateLink, cfips) {
             const originalRemark = vmConfig.ps || '';
 
             // 为每个启用的CFIP生成节点
-            for (const cfip of cfips) {
+            for (const [index, cfip] of cfips.entries()) {
                 // 复制配置对象
                 const newConfig = { ...vmConfig };
 
@@ -1411,7 +1468,7 @@ function generateArgoVlLinks(templateLink, cfips) {
                 newConfig.port = String(cfip.port || 443);
 
                 // 更新备注
-                newConfig.ps = `${originalRemark}-${cfip.name || cfip.remark || cfip.address}`;
+                newConfig.ps = buildArgoNodeRemark(originalRemark, cfip, index, remarkBuilder);
 
                 // 重新编码为base64
                 const newJsonStr = JSON.stringify(newConfig);
@@ -1825,16 +1882,14 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
     // 智能节点：在最前面插入最大速度和最低延迟节点
     let smartLinkCount = 0;
     if (enableSmartNode) {
-        if (!useSmartOnlyQuery) {
-            const smartNodeCfips = getSmartNodeCfips(cfips);
-            topSpeedCfips = topSpeedCount > 0
-                ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
-                : [];
-            topLatencyCfips = topLatencyCount > 0
-                ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
-                    .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
-                : [];
-        }
+        ({ topSpeedCfips, topLatencyCfips } = resolveSmartCfipGroups(
+            cfips,
+            topSpeedCfips,
+            topLatencyCfips,
+            useSmartOnlyQuery,
+            topSpeedCount,
+            topLatencyCount
+        ));
 
         const smartLinks = [];
         if (allProxies.length === 0) {
@@ -1874,22 +1929,7 @@ async function handleSubscribe(db, uuid, url, configParam = null) {
         links.unshift(...smartLinks);
     }
 
-    // 处理 extraCount 参数：额外展示订阅数量
-    // extraCount = 0: 不展示额外订阅（只保留智能节点）
-    // extraCount > 0: 保留智能节点 + extraCount 条额外订阅
-    // 如果 extraCount 大于实际订阅数量，则按实际数量为准
-    if (extraCount === 0 && enableSmartNode) {
-        // 只保留智能节点，移除所有其他订阅
-        return encodeSubscriptionResponse(links.slice(0, smartLinkCount));
-    } else if (extraCount > 0 && enableSmartNode) {
-        // 保留智能节点 + extraCount 条额外订阅
-        // 额外订阅数量不能超过实际订阅数量
-        const actualExtraCount = Math.min(extraCount, links.length - smartLinkCount);
-        const finalLinks = links.slice(0, smartLinkCount + actualExtraCount);
-        return encodeSubscriptionResponse(finalLinks);
-    }
-
-    return encodeSubscriptionResponse(links);
+    return encodeSubscriptionResponse(finalizeSmartSubscriptionLinks(links, smartLinkCount, enableSmartNode, extraCount));
 }
 
 // SS 公开订阅
@@ -2002,16 +2042,14 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
     // 智能节点：在最前面插入最大速度和最低延迟节点
     let smartLinkCount = 0;
     if (enableSmartNode) {
-        if (!useSmartOnlyQuery) {
-            const smartNodeCfips = getSmartNodeCfips(cfips);
-            topSpeedCfips = topSpeedCount > 0
-                ? [...smartNodeCfips].sort((a, b) => (b.speed || 0) - (a.speed || 0)).slice(0, topSpeedCount)
-                : [];
-            topLatencyCfips = topLatencyCount > 0
-                ? smartNodeCfips.filter(c => c.latency && c.latency > 0)
-                    .sort((a, b) => a.latency - b.latency).slice(0, topLatencyCount)
-                : [];
-        }
+        ({ topSpeedCfips, topLatencyCfips } = resolveSmartCfipGroups(
+            cfips,
+            topSpeedCfips,
+            topLatencyCfips,
+            useSmartOnlyQuery,
+            topSpeedCount,
+            topLatencyCount
+        ));
 
         const ssConfigStr = `${method}:${password}`;
         const encodedConfig = btoa(ssConfigStr);
@@ -2064,22 +2102,7 @@ async function handleSSSubscribe(db, password, url, configParam = null) {
         links.unshift(...smartLinks);
     }
 
-    // 处理 extraCount 参数：额外展示订阅数量
-    // extraCount = 0: 不展示额外订阅（只保留智能节点）
-    // extraCount > 0: 保留智能节点 + extraCount 条额外订阅
-    // 如果 extraCount 大于实际订阅数量，则按实际数量为准
-    if (extraCount === 0 && enableSmartNode) {
-        // 只保留智能节点，移除所有其他订阅
-        return encodeSubscriptionResponse(links.slice(0, smartLinkCount));
-    } else if (extraCount > 0 && enableSmartNode) {
-        // 保留智能节点 + extraCount 条额外订阅
-        // 额外订阅数量不能超过实际订阅数量
-        const actualExtraCount = Math.min(extraCount, links.length - smartLinkCount);
-        const finalLinks = links.slice(0, smartLinkCount + actualExtraCount);
-        return encodeSubscriptionResponse(finalLinks);
-    }
-
-    return encodeSubscriptionResponse(links);
+    return encodeSubscriptionResponse(finalizeSmartSubscriptionLinks(links, smartLinkCount, enableSmartNode, extraCount));
 }
 
 // SOCKS5 测速
