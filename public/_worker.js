@@ -1376,7 +1376,8 @@ async function handleArgoSubscribe(db, token, url) {
 
     // 3. 解析模板并替换优选域名/IP
     try {
-        const links = generateArgoVlLinks(template.template_link, smartOnly ? [] : cfips);
+        const preferredRemark = (template.remark || '').trim();
+        const links = generateArgoVlLinks(template.template_link, smartOnly ? [] : cfips, null, preferredRemark);
         let smartLinkCount = 0;
 
         if (enableSmartNode) {
@@ -1392,12 +1393,14 @@ async function handleArgoSubscribe(db, token, url) {
             const speedLinks = generateArgoVlLinks(
                 template.template_link,
                 topSpeedCfips,
-                (_cfip, index, originalRemark) => `最大速度${index + 1}-${originalRemark || 'ARGO'}`
+                (_cfip, index, originalRemark) => `最大速度${index + 1}-${originalRemark || 'ARGO'}`,
+                preferredRemark
             );
             const latencyLinks = generateArgoVlLinks(
                 template.template_link,
                 topLatencyCfips,
-                (_cfip, index, originalRemark) => `最低延迟${index + 1}-${originalRemark || 'ARGO'}`
+                (_cfip, index, originalRemark) => `最低延迟${index + 1}-${originalRemark || 'ARGO'}`,
+                preferredRemark
             );
             const smartLinks = [...speedLinks, ...latencyLinks];
             smartLinkCount = smartLinks.length;
@@ -1415,7 +1418,11 @@ function buildArgoNodeRemark(originalRemark, cfip, index, remarkBuilder) {
     return `${originalRemark}-${cfip.name || cfip.remark || cfip.address}`;
 }
 
-function generateArgoVlLinks(templateLink, cfips, remarkBuilder = null) {
+function resolveArgoOriginalRemark(templateRemark, preferredRemark) {
+    return preferredRemark || templateRemark || '';
+}
+
+function generateArgoVlLinks(templateLink, cfips, remarkBuilder = null, preferredRemark = '') {
     const links = [];
 
     // 判断是V<span>LESS</span>还是V<span>Mess</span>格式
@@ -1430,7 +1437,7 @@ function generateArgoVlLinks(templateLink, cfips, remarkBuilder = null) {
         }
 
         const [, uuid, , , queryString, fragment] = match;
-        const originalRemark = fragment ? decodeURIComponent(fragment.substring(1)) : '';
+        const originalRemark = resolveArgoOriginalRemark(fragment ? decodeURIComponent(fragment.substring(1)) : '', preferredRemark);
 
         // 为每个启用的CFIP生成节点
         for (const [index, cfip] of cfips.entries()) {
@@ -1456,7 +1463,7 @@ function generateArgoVlLinks(templateLink, cfips, remarkBuilder = null) {
             const jsonStr = decodeURIComponent(escape(atob(base64Data)));
             const vmConfig = JSON.parse(jsonStr);
 
-            const originalRemark = vmConfig.ps || '';
+            const originalRemark = resolveArgoOriginalRemark(vmConfig.ps || '', preferredRemark);
 
             // 为每个启用的CFIP生成节点
             for (const [index, cfip] of cfips.entries()) {

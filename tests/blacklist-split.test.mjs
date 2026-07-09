@@ -281,6 +281,61 @@ test('argo smart-only subscribe supports smart and blacklist URL parameters', as
     assert.match(cfipQueries[0], /LIMIT \? OFFSET \?/);
 });
 
+test('argo subscribe prefers config remark over vmess template ps', async () => {
+    const { handleArgoSubscribe } = await loadWorkerInternals();
+    const vmessConfig = {
+        v: '2',
+        ps: 'US-HostPapa',
+        add: 'origin.example.com',
+        port: '443',
+        id: 'a02d2665-fa72-4a03-9554-aab4625631d6',
+        aid: '0',
+        scy: 'auto',
+        net: 'ws',
+        type: 'none',
+        host: 'server14.example.com',
+        path: '/vmess-argo?ed=2560',
+        tls: 'tls',
+        sni: 'server14.example.com',
+        alpn: '',
+        fp: 'firefox',
+        allowInsecure: 'false',
+    };
+    const templateLink = `vmess://${Buffer.from(JSON.stringify(vmessConfig), 'utf8').toString('base64')}`;
+    const db = new MockDb([{
+        id: 1,
+        address: '198.51.100.1',
+        port: 443,
+        remark: 'cfip-1',
+        name: 'cfip-1',
+        status: 'enabled',
+        sync_blacklisted: 0,
+        node_blacklisted: 0,
+        sort_order: 1,
+        speed: 10000,
+        latency: 10,
+        fail_count: 0,
+    }], [{
+        token: 'argo-token',
+        template_link: templateLink,
+        remark: '美国 洛杉矶[CCS] LA5FJV',
+        enabled: 1,
+        include_blacklisted_cfip: 0,
+    }]);
+
+    const response = await handleArgoSubscribe(
+        db,
+        'argo-token',
+        'https://example.com/sub/argo/argo-token?speedTop=1&extraCount=0'
+    );
+    const encoded = await response.text();
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const generatedConfig = JSON.parse(Buffer.from(decoded.substring('vmess://'.length), 'base64').toString('utf8'));
+
+    assert.equal(generatedConfig.ps, '最大速度1-美国 洛杉矶[CCS] LA5FJV');
+    assert.equal(generatedConfig.add, '198.51.100.1');
+});
+
 test('typed blacklist API updates node blacklist independently', async () => {
     const { handleSetCFIPBlacklist } = await loadWorkerInternals();
     const db = new MockDb(createCfips());
