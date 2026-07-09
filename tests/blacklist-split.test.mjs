@@ -281,6 +281,56 @@ test('argo smart-only subscribe supports smart and blacklist URL parameters', as
     assert.match(cfipQueries[0], /LIMIT \? OFFSET \?/);
 });
 
+test('argo smart-only subscribe keeps domain CFIP candidates', async () => {
+    const { handleArgoSubscribe } = await loadWorkerInternals();
+    const db = new MockDb([
+        {
+            id: 1,
+            address: 'fast.example.com',
+            port: 443,
+            remark: 'domain-cfip',
+            name: 'domain-cfip',
+            status: 'enabled',
+            sync_blacklisted: 0,
+            node_blacklisted: 0,
+            sort_order: 1,
+            speed: 10000,
+            latency: 10,
+            fail_count: 0,
+        },
+        {
+            id: 2,
+            address: '198.51.100.2',
+            port: 443,
+            remark: 'ip-cfip',
+            name: 'ip-cfip',
+            status: 'enabled',
+            sync_blacklisted: 0,
+            node_blacklisted: 0,
+            sort_order: 2,
+            speed: 9000,
+            latency: 20,
+            fail_count: 0,
+        },
+    ], [{
+        token: 'argo-token',
+        template_link: 'vless://test-uuid@origin.example.com:443?encryption=none&security=tls&type=ws#ARGO',
+        enabled: 1,
+        include_blacklisted_cfip: 0,
+    }]);
+
+    const response = await handleArgoSubscribe(
+        db,
+        'argo-token',
+        'https://example.com/sub/argo/argo-token?speedTop=1&extraCount=0'
+    );
+    const encoded = await response.text();
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+
+    assert.match(decoded, /fast\.example\.com/);
+    assert.doesNotMatch(decoded, /198\.51\.100\.2/);
+});
+
 test('argo subscribe prefers config remark over vmess template ps', async () => {
     const { handleArgoSubscribe } = await loadWorkerInternals();
     const vmessConfig = {
@@ -334,6 +384,61 @@ test('argo subscribe prefers config remark over vmess template ps', async () => 
 
     assert.equal(generatedConfig.ps, '最大速度1-美国 洛杉矶[CCS] LA5FJV');
     assert.equal(generatedConfig.add, '198.51.100.1');
+});
+
+test('argo speedTop without extraCount keeps regular nodes', async () => {
+    const { handleArgoSubscribe } = await loadWorkerInternals();
+    const db = new MockDb([
+        {
+            id: 1,
+            address: '198.51.100.1',
+            port: 443,
+            remark: 'cfip-1',
+            name: 'cfip-1',
+            status: 'enabled',
+            sync_blacklisted: 0,
+            node_blacklisted: 0,
+            sort_order: 1,
+            speed: 10000,
+            latency: 10,
+            fail_count: 0,
+        },
+        {
+            id: 2,
+            address: '198.51.100.2',
+            port: 443,
+            remark: 'cfip-2',
+            name: 'cfip-2',
+            status: 'enabled',
+            sync_blacklisted: 0,
+            node_blacklisted: 0,
+            sort_order: 2,
+            speed: 9000,
+            latency: 20,
+            fail_count: 0,
+        },
+    ], [{
+        token: 'argo-token',
+        template_link: 'vless://test-uuid@origin.example.com:443?encryption=none&security=tls&type=ws#TemplateName',
+        remark: '美国 洛杉矶[CCS] LA5FJV',
+        enabled: 1,
+        include_blacklisted_cfip: 0,
+    }]);
+
+    const response = await handleArgoSubscribe(
+        db,
+        'argo-token',
+        'https://example.com/sub/argo/argo-token?speedTop=1'
+    );
+    const encoded = await response.text();
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const readable = decodeURIComponent(decoded);
+    const lines = decoded.split('\n').filter(Boolean);
+
+    assert.equal(lines.length, 3);
+    assert.match(readable, /最大速度1-美国 洛杉矶\[CCS\] LA5FJV/);
+    assert.match(readable, /美国 洛杉矶\[CCS\] LA5FJV-cfip-1/);
+    assert.match(readable, /美国 洛杉矶\[CCS\] LA5FJV-cfip-2/);
 });
 
 test('typed blacklist API updates node blacklist independently', async () => {

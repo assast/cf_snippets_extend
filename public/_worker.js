@@ -323,12 +323,12 @@ function parseSmartNodeCounts(urlParams) {
     return {
         topSpeedCount: parseSmartNodeCount(urlParams.get('speedTop')),
         topLatencyCount: parseSmartNodeCount(urlParams.get('latencyTop')),
-        extraCount: parseSmartNodeCount(urlParams.get('extraCount')),
+        extraCount: urlParams.has('extraCount') ? parseSmartNodeCount(urlParams.get('extraCount')) : null,
     };
 }
 
 function getSmartNodeCfips(cfips) {
-    return cfips.filter(cfip => parseProxyType(cfip?.address) !== 'domain');
+    return cfips;
 }
 
 function buildCfipWhereClause(cfipStatusParam, cfipSubscribeCondition) {

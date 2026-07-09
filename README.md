@@ -395,7 +395,7 @@
   - `extraCount=N`（N>0）：展示智能节点 + N 条额外订阅
   - 如果配置的数量大于实际订阅数量，则按实际数量为准
   - 未指定时，展示所有订阅（默认行为）
-- `speedTop` 和 `latencyTop` 只会从 IP 类型的 CFIP 中挑选，自动排除域名类型
+- `speedTop` 和 `latencyTop` 会从所有 CFIP 中挑选，包括域名类型
 
 **使用示例：**
 
