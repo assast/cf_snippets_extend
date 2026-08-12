@@ -1,3 +1,5 @@
+
+
 # CF-Snippets/Pages-Extend
 
 > 一个功能强大的 Cloudflare Pages 代理管理工具，集成 ProxyIP、全局出站、CFIP 管理和订阅生成功能
@@ -217,8 +219,8 @@
 ### 步骤 8：导入初始数据（可选）
 
 为了快速开始使用，项目提供了初始数据文件 `initial-data.json`，包含：
-- 2 个 ProxyIP 示例
-- 5 个 CFIP 优选域名/IP
+- 1 个 ProxyIP 示例
+- 10 个 CFIP 优选域名/IP
 
 **导入步骤：**
 
