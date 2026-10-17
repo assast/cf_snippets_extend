@@ -231,6 +231,17 @@ URL 参数兼容驼峰别名 `includeBlacklistedCfip`。
 
 `changes` 表示实际删除行数。
 
+当 D1 免费套餐的每日写入额度耗尽时，返回 **HTTP 429**：
+
+```json
+{
+  "error": "D1 今日写入额度已用完（删除也占用写入额度），请等待每日 UTC 00:00（北京时间 08:00）重置后重试，或升级 Workers 付费套餐。",
+  "code": "D1_DAILY_WRITE_LIMIT_EXCEEDED"
+}
+```
+
+其他数据库异常返回 **HTTP 500** 和通用 `error` 提示，详细异常记录在服务端日志中。
+
 ## 批量状态更新
 
 - **URL**: `/api/cfip/batch/status`

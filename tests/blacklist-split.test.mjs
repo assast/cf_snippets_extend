@@ -477,3 +477,43 @@ test('batch delete CFIP by fail_count threshold deletes matching records', async
     assert.equal(payload.data.changes, 2);
     assert.deepEqual(remainingIds, [3]);
 });
+
+const d1WriteLimitMessage = "Your account has exceeded D1's free tier daily row write limit. Upgrade to a paid plan or wait until tomorrow (midnight UTC) to continue.";
+for (const { name, error, status, code } of [
+    { name: 'daily write limit', error: new Error('D1_ERROR: ' + d1WriteLimitMessage), status: 429, code: 'D1_DAILY_WRITE_LIMIT_EXCEEDED' },
+    { name: 'daily write limit in cause', error: new Error('D1_ERROR: Database query failed', { cause: new Error(d1WriteLimitMessage) }), status: 429, code: 'D1_DAILY_WRITE_LIMIT_EXCEEDED' },
+    { name: 'other database error', error: new Error('D1_ERROR: no such table: cf_ips'), status: 500 },
+]) {
+    test(`batch delete CFIP returns JSON for ${name}`, async (t) => {
+        const { handleBatchDeleteCFIPByFailCount } = await loadWorkerInternals();
+        const errorLog = t.mock.method(console, 'error', () => {});
+        const db = {
+            prepare() {
+                return {
+                    bind() { return this; },
+                    async run() { throw error; },
+                };
+            },
+        };
+        const request = new Request('https://example.com/api/cfip/batch/delete-by-fail-count', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fail_count: 1 }),
+        });
+
+        const response = await handleBatchDeleteCFIPByFailCount(request, db);
+        const payload = await response.json();
+
+        assert.equal(response.status, status);
+        assert.equal(response.headers.get('Content-Type'), 'application/json');
+        assert.equal(payload.code, code);
+        assert.equal(errorLog.mock.callCount(), 1);
+        if (status === 429) {
+            assert.match(payload.error, /写入额度/);
+            assert.match(payload.error, /08:00/);
+        } else {
+            assert.match(payload.error, /删除失败/);
+            assert.doesNotMatch(payload.error, /no such table/);
+        }
+    });
+}

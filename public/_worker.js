@@ -1075,8 +1075,21 @@ async function handleBatchDeleteCFIPByFailCount(request, db) {
     const failCount = parsePositiveInteger(body.fail_count ?? body.failCount ?? body.min_fail_count ?? body.threshold);
     if (!failCount) return json({ error: '失败次数阈值必须是正整数' }, 400);
 
-    const result = await db.prepare('DELETE FROM cf_ips WHERE COALESCE(fail_count, 0) >= ?')
-        .bind(failCount).run();
+    let result;
+    try {
+        result = await db.prepare('DELETE FROM cf_ips WHERE COALESCE(fail_count, 0) >= ?')
+            .bind(failCount).run();
+    } catch (error) {
+        console.error('Batch CFIP deletion by fail count failed:', error);
+        const errorMessage = `${error.message ?? ''} ${error.cause?.message ?? ''}`;
+        if (errorMessage.includes("D1's free tier daily row write limit")) {
+            return json({
+                error: 'D1 今日写入额度已用完（删除也占用写入额度），请等待每日 UTC 00:00（北京时间 08:00）重置后重试，或升级 Workers 付费套餐。',
+                code: 'D1_DAILY_WRITE_LIMIT_EXCEEDED'
+            }, 429);
+        }
+        return json({ error: '批量删除失败，请稍后重试或查看服务端日志' }, 500);
+    }
     return json({
         success: true,
         data: {
