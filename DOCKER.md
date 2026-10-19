@@ -46,10 +46,12 @@ ghcr.io/assast/cf_snippets_extend:sha-<短提交哈希>
 
    ```bash
    docker compose stop
+   # 容器以 UID 1000 运行；单文件只读挂载避免开放整个备份目录。
+   sudo chown 1000:1000 backups/cloudflare-d1.sql
    docker compose run --rm --no-deps \
-     -v "$PWD/backups:/backups:ro" \
+     -v "$PWD/backups/cloudflare-d1.sql:/backup.sql:ro" \
      cf-snippets-extend \
-     node server/import-d1.mjs /backups/cloudflare-d1.sql /data/snippets.sqlite
+     node server/import-d1.mjs /backup.sql /data/snippets.sqlite
    docker compose up -d
    ```
 
