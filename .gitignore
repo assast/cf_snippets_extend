@@ -37,3 +37,10 @@ openspec
 /.venv
 .agent
 /worker-proxy/wrangler.toml
+
+# Docker 持久数据及 Cloudflare 迁移备份
+/data/
+/backups/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

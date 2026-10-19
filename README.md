@@ -7,7 +7,9 @@
 
 ## 📢 部署说明
 
-**本项目采用 Cloudflare Pages 部署方式**
+**支持 Docker 和 Cloudflare Pages 部署。Docker 安装、GitHub Actions 镜像构建与完整 D1 数据迁移见 [Docker 部署指南](DOCKER.md)。**
+
+以下为 Cloudflare Pages 部署说明：
 
 - ✅ 支持 Git 集成，自动部署
 - ✅ 无限请求额度

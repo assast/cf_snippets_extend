@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!package.json
+!server/
+!server/**
+!public/
+!public/**

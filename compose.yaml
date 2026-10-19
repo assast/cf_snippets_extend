@@ -1,0 +1,22 @@
+services:
+  cf-snippets-extend:
+    image: ${IMAGE:-ghcr.io/assast/cf_snippets_extend:latest}
+    container_name: cf-snippets-extend
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${HTTP_PORT:-58180}:3000"
+    environment:
+      API_KEY: ${API_KEY:?请在 .env 中设置 API_KEY}
+      PAGES_HOSTNAME: ${PAGES_HOSTNAME:-}
+    volumes:
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
